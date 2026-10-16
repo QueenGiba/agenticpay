@@ -1,3 +1,14 @@
+import { randomUUID } from 'node:crypto';
+
+export const DEFAULT_PAYOUT_APPROVAL_THRESHOLD = 10_000;
+
+export type PayoutApproverRole = 'finance_approver' | 'admin';
+
+export interface PayoutApprover {
+  id: string;
+  role: PayoutApproverRole;
+}
+
 export interface PayoutSchedule {
   id: string;
   merchantId: string;
@@ -9,18 +20,50 @@ export interface PayoutSchedule {
 
 export interface PayoutBatch {
   id: string;
+  merchantId: string;
   status: 'pending' | 'executing' | 'completed' | 'failed';
   amount: number;
   asset: string;
   transactionsCount: number;
   errorMessage?: string;
+  rejectedBy?: string;
   createdAt: Date;
+}
+
+export interface PayoutAuditEntry {
+  batchId: string;
+  action: 'created' | 'approved' | 'rejected' | 'retried';
+  actorId: string;
+  timestamp: Date;
+  details?: string;
+}
+
+export interface PayoutEngineOptions {
+  /** Payouts at or above this amount always need an approver. Defaults to PAYOUT_APPROVAL_THRESHOLD or 10,000. */
+  approvalThreshold?: number;
+}
+
+const APPROVER_ROLES: readonly PayoutApproverRole[] = ['finance_approver', 'admin'];
+
+function resolveApprovalThreshold(explicit?: number): number {
+  const fromEnv = Number(process.env.PAYOUT_APPROVAL_THRESHOLD);
+  const threshold = explicit ?? (fromEnv > 0 ? fromEnv : DEFAULT_PAYOUT_APPROVAL_THRESHOLD);
+  if (!Number.isFinite(threshold) || threshold <= 0) {
+    throw new Error('INVALID_PAYOUT_APPROVAL_THRESHOLD');
+  }
+  return threshold;
 }
 
 export class PayoutEngine {
   private schedules: PayoutSchedule[] = [];
   private batches: PayoutBatch[] = [];
+  private auditTrail: PayoutAuditEntry[] = [];
   private pendingAmounts: Map<string, number> = new Map(); // merchantId -> amount
+  readonly approvalThreshold: number;
+
+  constructor(options: PayoutEngineOptions = {}) {
+    this.approvalThreshold = resolveApprovalThreshold(options.approvalThreshold);
+  }
 
   setPendingAmount(merchantId: string, amount: number) {
     this.pendingAmounts.set(merchantId, amount);
@@ -49,21 +92,21 @@ export class PayoutEngine {
       }
 
       if (triggerPayout) {
-        const batchId = Math.random().toString(36).substring(7);
+        const requiresApproval = pending > schedule.autoApproveLimit || pending >= this.approvalThreshold;
         const batch: PayoutBatch = {
-          id: batchId,
-          status: pending > schedule.autoApproveLimit ? 'pending' : 'completed',
+          id: randomUUID(),
+          merchantId: schedule.merchantId,
+          status: requiresApproval ? 'pending' : 'completed',
           amount: pending,
           asset: schedule.preferredAsset,
           transactionsCount: 1,
           createdAt: new Date(),
         };
 
-        if (batch.status === 'completed') {
-          this.pendingAmounts.set(schedule.merchantId, 0);
-        }
-
+        // Reserve the funds for every batch so the next evaluation cannot create a duplicate payout.
+        this.pendingAmounts.set(schedule.merchantId, 0);
         this.batches.push(batch);
+        this.record(batch.id, 'created', 'system', requiresApproval ? 'Awaiting approval' : 'Auto-approved');
         executedBatches.push(batch);
       }
     }
@@ -71,30 +114,40 @@ export class PayoutEngine {
     return executedBatches;
   }
 
-  async approveManualPayout(batchId: string): Promise<boolean> {
+  async approveManualPayout(batchId: string, approver: PayoutApprover): Promise<boolean> {
+    this.assertApprover(approver);
     const batch = this.batches.find(b => b.id === batchId);
     if (batch && batch.status === 'pending') {
       batch.status = 'completed';
+      this.record(batchId, 'approved', approver.id);
       return true;
     }
     return false;
   }
 
-  async rejectManualPayout(batchId: string): Promise<boolean> {
+  async rejectManualPayout(batchId: string, approver: PayoutApprover): Promise<boolean> {
+    this.assertApprover(approver);
     const batch = this.batches.find(b => b.id === batchId);
     if (batch && batch.status === 'pending') {
       batch.status = 'failed';
       batch.errorMessage = 'Rejected by manual review';
+      batch.rejectedBy = approver.id;
+      // Return the reserved funds to the merchant's pending balance.
+      this.pendingAmounts.set(batch.merchantId, this.getPendingAmount(batch.merchantId) + batch.amount);
+      this.record(batchId, 'rejected', approver.id, batch.errorMessage);
       return true;
     }
     return false;
   }
 
-  async retryFailedBatch(batchId: string): Promise<boolean> {
+  async retryFailedBatch(batchId: string, approver: PayoutApprover): Promise<boolean> {
+    this.assertApprover(approver);
     const batch = this.batches.find(b => b.id === batchId);
-    if (batch && batch.status === 'failed') {
-      batch.status = 'completed';
+    // Rejected payouts are final; a retry would bypass the review that rejected them.
+    if (batch && batch.status === 'failed' && !batch.rejectedBy) {
+      batch.status = 'pending';
       delete batch.errorMessage;
+      this.record(batchId, 'retried', approver.id, 'Returned to approval queue');
       return true;
     }
     return false;
@@ -102,5 +155,19 @@ export class PayoutEngine {
 
   getPayoutHistory(): PayoutBatch[] {
     return this.batches;
+  }
+
+  getAuditTrail(batchId?: string): PayoutAuditEntry[] {
+    return batchId ? this.auditTrail.filter(entry => entry.batchId === batchId) : [...this.auditTrail];
+  }
+
+  private assertApprover(approver: PayoutApprover): void {
+    if (!approver?.id || !APPROVER_ROLES.includes(approver.role)) {
+      throw new Error('PAYOUT_APPROVER_FORBIDDEN');
+    }
+  }
+
+  private record(batchId: string, action: PayoutAuditEntry['action'], actorId: string, details?: string): void {
+    this.auditTrail.push({ batchId, action, actorId, timestamp: new Date(), details });
   }
 }
