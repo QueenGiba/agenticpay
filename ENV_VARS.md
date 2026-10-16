@@ -14,6 +14,7 @@
 | VAPID_PRIVATE_KEY    | VAPID private key for Web Push API  | auto-generated | No       |
 | WS_ENABLED           | Enable/disable WebSocket support    | true    | No       |
 | WS_PORT              | WebSocket port                      | 3001    | No       |
+| PAYOUT_APPROVAL_THRESHOLD | Payouts at or above this amount require approval | 10000 | No |
 
 ## Frontend
 
